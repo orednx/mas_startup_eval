@@ -23,6 +23,8 @@ import pandas as pd
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from preprocessing import YEARS, compute_trend
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROMPTS_DIR = PROJECT_ROOT / "prompts"
 MODEL = "claude-sonnet-4-6"
@@ -38,16 +40,17 @@ SCOUT_FIELDS = [
     "Name", "суть_проекта", "ключевые_слова_nlp", "рынок",
     "основатель", "вуз", "регион", "год",
 ]
+# pat_cagr_rus_18_24 / pat_foreign_cagr / pub_cagr_18_24 / *_total намеренно
+# не в списке — это "сырой" CAGR/total из исходных данных, который даёт
+# аномальные значения при малой базе. Вместо них Технологу передаются
+# предвычисленные показатели из preprocessing.compute_trend() (см. build_tech_payload).
 TECH_FIELDS = [
     "pat_rus_2018", "pat_rus_2019", "pat_rus_2020", "pat_rus_2021",
-    "pat_rus_2022", "pat_rus_2023", "pat_rus_2024",
-    "pat_cagr_rus_18_24", "pat_rus_total", "pat_query_ru",
+    "pat_rus_2022", "pat_rus_2023", "pat_rus_2024", "pat_query_ru",
     "pub_2018", "pub_2019", "pub_2020", "pub_2021",
-    "pub_2022", "pub_2023", "pub_2024",
-    "pub_cagr_18_24", "pub_cite_avg", "pub_total", "pub_query_en",
+    "pub_2022", "pub_2023", "pub_2024", "pub_cite_avg", "pub_query_en",
     "pat_foreign_2018", "pat_foreign_2019", "pat_foreign_2020", "pat_foreign_2021",
-    "pat_foreign_2022", "pat_foreign_2023", "pat_foreign_2024",
-    "pat_foreign_cagr", "pat_foreign_total", "pat_foreign_query",
+    "pat_foreign_2022", "pat_foreign_2023", "pat_foreign_2024", "pat_foreign_query",
 ]
 MARKET_FIELDS = ["рынок", "инвестиции", "регион", "год"]
 TEAM_FIELDS = ["основатель", "вуз", "регион", "год"]
@@ -69,11 +72,15 @@ SCOUT_SCHEMA = {
         "refined_keywords": {"type": "array", "items": {"type": "string"}},
         "data_quality_flags": {"type": "array", "items": {"type": "string"}},
         "summary": {"type": "string"},
+        "input_completeness": {
+            "type": "string",
+            "enum": ["полные_данные", "только_ключевые_слова", "минимальные_данные"],
+        },
     },
     "required": [
         "startup_name", "domain", "business_model", "target_customer",
         "development_stage_signal", "refined_keywords",
-        "data_quality_flags", "summary",
+        "data_quality_flags", "summary", "input_completeness",
     ],
     "additionalProperties": False,
 }
@@ -195,14 +202,19 @@ def select_fields(row: pd.Series, fields: list[str]) -> dict:
     return out
 
 
-def call_agent(client: Anthropic, system_prompt: str, payload: dict, schema: dict, agent_name: str) -> dict:
+def call_agent(client: Anthropic, system_prompt: str, payload: dict, schema: dict, agent_name: str, model: str = MODEL) -> dict:
     """Вызывает одного агента с structured output. При ошибке API или парсинга
     возвращает словарь с ключом _error, не прерывая обработку остальных стартапов."""
     try:
         response = client.messages.create(
-            model=MODEL,
+            model=model,
             max_tokens=MAX_TOKENS,
             system=system_prompt,
+            # Явно выключаем thinking: на части моделей (например, Sonnet 5)
+            # adaptive thinking включён по умолчанию и делит один max_tokens
+            # с текстом ответа — структурированный JSON может обрезаться
+            # посередине. Без этого поведение агентов зависело бы от модели.
+            thinking={"type": "disabled"},
             output_config={"format": {"type": "json_schema", "schema": schema}},
             messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)}],
         )
@@ -212,22 +224,47 @@ def call_agent(client: Anthropic, system_prompt: str, payload: dict, schema: dic
         return {"_error": f"{agent_name}: {type(e).__name__}: {e}"}
 
 
-def process_startup(client: Anthropic, row: pd.Series) -> dict:
+def build_tech_payload(row: pd.Series, scout_result: dict) -> dict:
+    """Сырые ряды по трём источникам (для контекста) + предвычисленные в Python
+    показатели тренда (total/суммы по периодам/growth_ratio/low_base/trend_label),
+    чтобы Технологу не приходилось самому считать динамику по сырым числам."""
+    payload = select_fields(row, TECH_FIELDS)
+    payload["pat_rus_indicators"] = compute_trend({y: row.get(f"pat_rus_{y}") for y in YEARS})
+    payload["pat_foreign_indicators"] = compute_trend({y: row.get(f"pat_foreign_{y}") for y in YEARS})
+    payload["pub_indicators"] = compute_trend({y: row.get(f"pub_{y}") for y in YEARS})
+    payload["профиль_разведчика"] = scout_result
+    return payload
+
+
+def process_startup(client: Anthropic, row: pd.Series, skip_agents: list[str] = [], model: str = MODEL) -> dict:
+    """skip_agents — имена специалистов ("technologist"/"market"/"team"), которые
+    нужно пропустить для ablation study. Пропущенный агент даёт None и на входе
+    Интегратора, и в сохранённом результате — Интегратор промптом умеет работать
+    с отсутствующим измерением (см. missing_dimensions в его схеме)."""
     scout_payload = select_fields(row, SCOUT_FIELDS)
-    scout_result = call_agent(client, SCOUT_PROMPT, scout_payload, SCOUT_SCHEMA, "Scout")
+    scout_result = call_agent(client, SCOUT_PROMPT, scout_payload, SCOUT_SCHEMA, "Scout", model)
 
     shared_context = {"профиль_разведчика": scout_result}
-    tech_payload = {**select_fields(row, TECH_FIELDS), **shared_context}
+    tech_payload = build_tech_payload(row, scout_result)
     market_payload = {**select_fields(row, MARKET_FIELDS), **shared_context}
     team_payload = {**select_fields(row, TEAM_FIELDS), **shared_context}
 
+    agent_specs = {
+        "technologist": (TECH_PROMPT, tech_payload, TECH_SCHEMA),
+        "market": (MARKET_PROMPT, market_payload, MARKET_SCHEMA),
+        "team": (TEAM_PROMPT, team_payload, TEAM_SCHEMA),
+    }
+
+    parallel_results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {
-            "technologist": executor.submit(call_agent, client, TECH_PROMPT, tech_payload, TECH_SCHEMA, "Technologist"),
-            "market": executor.submit(call_agent, client, MARKET_PROMPT, market_payload, MARKET_SCHEMA, "Market"),
-            "team": executor.submit(call_agent, client, TEAM_PROMPT, team_payload, TEAM_SCHEMA, "Team"),
-        }
-        parallel_results = {name: f.result() for name, f in futures.items()}
+        futures = {}
+        for name, (prompt, payload, schema) in agent_specs.items():
+            if name in skip_agents:
+                parallel_results[name] = None
+            else:
+                futures[name] = executor.submit(call_agent, client, prompt, payload, schema, name.capitalize(), model)
+        for name, f in futures.items():
+            parallel_results[name] = f.result()
 
     integrator_payload = {
         "профиль_разведчика": scout_result,
@@ -235,7 +272,7 @@ def process_startup(client: Anthropic, row: pd.Series) -> dict:
         "вывод_рынка": parallel_results["market"],
         "вывод_команды": parallel_results["team"],
     }
-    integrator_result = call_agent(client, INTEGRATOR_PROMPT, integrator_payload, INTEGRATOR_SCHEMA, "Integrator")
+    integrator_result = call_agent(client, INTEGRATOR_PROMPT, integrator_payload, INTEGRATOR_SCHEMA, "Integrator", model)
 
     return {
         "scout": scout_result,
@@ -251,8 +288,11 @@ def to_summary_row(idx: int, name: str, result: dict) -> dict:
         result["scout"], result["technologist"], result["market"], result["team"], result["integrator"]
     )
     errors = [
-        d["_error"] for d in (scout, tech, market, team, integrator) if "_error" in d
+        d["_error"] for d in (scout, tech, market, team, integrator) if d is not None and "_error" in d
     ]
+    tech = tech or {}
+    market = market or {}
+    team = team or {}
     return {
         "idx": idx,
         "Name": name,
@@ -276,11 +316,69 @@ def load_table(path: Path) -> pd.DataFrame:
     return pd.read_excel(path)
 
 
+# Сколько подряд неудачных стартапов означает системную проблему (кончились
+# кредиты API, неверный ключ, нет сети), а не разовый сбой одного вызова.
+FAILURE_THRESHOLD = 5
+
+
+def _atomic_write(write_fn, path: Path) -> None:
+    """Пишет через временный файл + rename, чтобы обрыв процесса ровно во
+    время записи не оставил битый results.csv/JSON вместо предыдущей
+    валидной версии."""
+    tmp_path = path.parent / (path.name + ".tmp")
+    write_fn(tmp_path)
+    tmp_path.replace(path)
+
+
+def save_json(result: dict, path: Path) -> None:
+    _atomic_write(lambda p: p.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"), path)
+
+
+def save_results_csv(summary_rows: list[dict], path: Path) -> None:
+    _atomic_write(lambda p: pd.DataFrame(summary_rows).to_csv(p, index=False), path)
+
+
+def is_complete(result: dict) -> bool:
+    """Стартап считается успешно посчитанным, если Scout и Integrator
+    отработали без ошибок (Technologist/Market/Team могут быть None из-за
+    --skip-agent — это не ошибка, а осознанный ablation)."""
+    return "_error" not in result.get("scout", {}) and "_error" not in result.get("integrator", {})
+
+
+def load_cached(path: Path, name: str, model: str) -> dict | None:
+    """Возвращает сохранённый результат, если он есть, читается и относится
+    к тому же стартапу (Name) и той же модели — иначе None, и стартап будет
+    пересчитан. Сверка по Name защищает от коллизий idx при переиспользовании
+    --output-dir для другого входного файла; сверка по модели — от того, чтобы
+    сравнение моделей (--model) по ошибке подхватило кэш от предыдущей."""
+    if not path.exists():
+        return None
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if cached.get("_name") != name or cached.get("_model") != model:
+        return None
+    return cached
+
+
 def main():
     parser = argparse.ArgumentParser(description="Пайплайн МАС для оценки стартапов")
     parser.add_argument("--input", default="Data/Startups.xlsx", help="Путь к входной таблице (xlsx/csv)")
     parser.add_argument("--output-dir", default="results", help="Куда сохранять результаты")
     parser.add_argument("--limit", type=int, default=None, help="Ограничить число стартапов (для отладки)")
+    parser.add_argument(
+        "--skip-agent", nargs="+", choices=["technologist", "market", "team"],
+        default=[], help="Пропустить указанных специалистов (для ablation study)",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Пересчитать все стартапы заново, даже уже успешно сохранённые (по умолчанию они пропускаются)",
+    )
+    parser.add_argument(
+        "--model", default=MODEL,
+        help=f"Модель для всех 5 агентов (по умолчанию {MODEL})",
+    )
     args = parser.parse_args()
 
     load_dotenv(PROJECT_ROOT / ".env")
@@ -293,22 +391,46 @@ def main():
 
     output_dir = PROJECT_ROOT / args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    results_csv_path = output_dir / "results.csv"
 
     summary_rows = []
     total = len(df)
+    consecutive_failures = 0
+
     for position, (idx, row) in enumerate(df.iterrows(), start=1):
         name = row.get("Name", f"row_{idx}")
-        print(f"[{position}/{total}] {name}")
+        json_path = output_dir / f"{idx:04d}.json"
 
-        result = process_startup(client, row)
+        cached = None if args.force else load_cached(json_path, name, args.model)
+        if cached is not None and is_complete(cached):
+            print(f"[{position}/{total}] {name} — уже посчитан, пропускаю")
+            result = cached
+        else:
+            print(f"[{position}/{total}] {name}")
+            result = process_startup(client, row, skip_agents=args.skip_agent, model=args.model)
+            result["_name"] = name
+            result["_model"] = args.model
+            save_json(result, json_path)
 
-        with open(output_dir / f"{idx:04d}.json", "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+            if is_complete(result):
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= FAILURE_THRESHOLD:
+                    summary_rows.append(to_summary_row(idx, name, result))
+                    save_results_csv(summary_rows, results_csv_path)
+                    print(
+                        f"\nОСТАНОВКА: {FAILURE_THRESHOLD} стартапов подряд завершились с ошибкой — "
+                        f"похоже на системную проблему (кончились кредиты API, неверный ключ, нет сети), "
+                        f"а не на разовый сбой. Прогон прерван, всё уже посчитанное сохранено в {output_dir}/. "
+                        f"После устранения причины перезапустите ту же команду — уже готовые стартапы "
+                        f"пересчитываться не будут."
+                    )
+                    return
 
         summary_rows.append(to_summary_row(idx, name, result))
+        save_results_csv(summary_rows, results_csv_path)
 
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(output_dir / "results.csv", index=False)
     print(f"\nГотово: {len(summary_rows)} стартапов обработано, результаты в {output_dir}/")
 
 
