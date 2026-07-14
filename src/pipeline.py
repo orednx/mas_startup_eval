@@ -10,8 +10,8 @@ Claude API в последовательно-параллельной схеме
 и ablation study) и сводную таблицу с итоговыми оценками.
 
 Использование (из корня проекта):
-    python src/pipeline.py --input Data/startups.xlsx --limit 20
-    python src/pipeline.py --input Data/startups.xlsx --output-dir results
+    python src/pipeline.py --input Data/Startups.xlsx --limit 20
+    python src/pipeline.py --input Data/Startups.xlsx --output-dir results
 """
 
 import argparse
@@ -28,9 +28,12 @@ PROMPTS_DIR = PROJECT_ROOT / "prompts"
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
 
-# Белые списки полей, передаваемых каждому агенту. Поля, палящие исход
-# (Уровень_исхода_0_3, Верифицирован, Источник_исхода, Комментарий_исхода, url),
-# сюда намеренно не включены и агентам никогда не передаются.
+# Белые списки полей, передаваемых каждому агенту. Поля, палящие исход или
+# принадлежность к группе (Уровень_исхода_0_3, Верифицирован, Источник_исхода,
+# Комментарий_исхода, url, топ_программа, число попаданий в топ), сюда
+# намеренно не включены и агентам никогда не передаются — они физически
+# отсутствуют в Data/Startups.xlsx и хранятся отдельно у пользователя для
+# валидации после прогона.
 SCOUT_FIELDS = [
     "Name", "суть_проекта", "ключевые_слова_nlp", "рынок",
     "основатель", "вуз", "регион", "год",
@@ -38,13 +41,13 @@ SCOUT_FIELDS = [
 TECH_FIELDS = [
     "pat_rus_2018", "pat_rus_2019", "pat_rus_2020", "pat_rus_2021",
     "pat_rus_2022", "pat_rus_2023", "pat_rus_2024",
-    "pat_cagr_rus_18_24", "pat_total", "pat_query_ru",
+    "pat_cagr_rus_18_24", "pat_rus_total", "pat_query_ru",
     "pub_2018", "pub_2019", "pub_2020", "pub_2021",
     "pub_2022", "pub_2023", "pub_2024",
     "pub_cagr_18_24", "pub_cite_avg", "pub_total", "pub_query_en",
-    "lens_2018", "lens_2019", "lens_2020", "lens_2021",
-    "lens_2022", "lens_2023", "lens_2024",
-    "lens_cagr_18_24", "lens_total", "lens_query_en",
+    "pat_foreign_2018", "pat_foreign_2019", "pat_foreign_2020", "pat_foreign_2021",
+    "pat_foreign_2022", "pat_foreign_2023", "pat_foreign_2024",
+    "pat_foreign_cagr", "pat_foreign_total", "pat_foreign_query",
 ]
 MARKET_FIELDS = ["рынок", "инвестиции", "регион", "год"]
 TEAM_FIELDS = ["основатель", "вуз", "регион", "год"]
@@ -80,7 +83,7 @@ TECH_SCHEMA = {
     "properties": {
         "ru_patent_trend": {"type": "string", "enum": ["растущий", "стабильный", "снижающийся", "нет данных"]},
         "global_publication_trend": {"type": "string", "enum": ["растущий", "стабильный", "снижающийся", "нет данных"]},
-        "global_lens_trend": {"type": "string", "enum": ["растущий", "стабильный", "снижающийся", "нет данных"]},
+        "foreign_patent_trend": {"type": "string", "enum": ["растущий", "стабильный", "снижающийся", "нет данных"]},
         "niche_scale": {
             "type": "string",
             "enum": ["крупная устоявшаяся область", "средняя ниша", "узкая/зарождающаяся ниша", "нет данных"],
@@ -92,7 +95,7 @@ TECH_SCHEMA = {
         "reasoning": {"type": "string"},
     },
     "required": [
-        "ru_patent_trend", "global_publication_trend", "global_lens_trend",
+        "ru_patent_trend", "global_publication_trend", "foreign_patent_trend",
         "niche_scale", "ru_vs_global_alignment", "innovation_momentum_score",
         "confidence", "key_signals", "reasoning",
     ],
@@ -275,7 +278,7 @@ def load_table(path: Path) -> pd.DataFrame:
 
 def main():
     parser = argparse.ArgumentParser(description="Пайплайн МАС для оценки стартапов")
-    parser.add_argument("--input", default="Data/startups.xlsx", help="Путь к входной таблице (xlsx/csv)")
+    parser.add_argument("--input", default="Data/Startups.xlsx", help="Путь к входной таблице (xlsx/csv)")
     parser.add_argument("--output-dir", default="results", help="Куда сохранять результаты")
     parser.add_argument("--limit", type=int, default=None, help="Ограничить число стартапов (для отладки)")
     args = parser.parse_args()
