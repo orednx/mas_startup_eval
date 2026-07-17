@@ -186,11 +186,14 @@ INTEGRATOR_SCHEMA = {
         },
         "key_strengths": {"type": "array", "items": {"type": "string"}},
         "key_risks": {"type": "array", "items": {"type": "string"}},
+        "expert_top_likelihood": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
+        "expert_top_rationale": {"type": "string"},
         "rationale": {"type": "string"},
     },
     "required": [
         "final_score", "score_label", "confidence", "missing_dimensions",
-        "dimension_summary", "key_strengths", "key_risks", "rationale",
+        "dimension_summary", "key_strengths", "key_risks",
+        "expert_top_likelihood", "expert_top_rationale", "rationale",
     ],
     "additionalProperties": False,
 }
@@ -343,6 +346,7 @@ def to_summary_row(idx: int, name: str, result: dict) -> dict:
         "team_score": team.get("team_strength_score"),
         "team_confidence": team.get("confidence"),
         "rationale": integrator.get("rationale"),
+        "expert_top_likelihood": integrator.get("expert_top_likelihood"),
         "errors": "; ".join(errors) if errors else "",
     }
 
