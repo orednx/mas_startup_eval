@@ -7,3 +7,4 @@ results/
 results_batch/
 private/
 .DS_Store
+logs/

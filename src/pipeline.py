@@ -2,9 +2,14 @@
 Пайплайн мультиагентной системы оценки перспективности стартапов.
 
 Читает таблицу со стартапами (Excel/CSV), прогоняет каждый через 5 агентов
-Claude API в последовательно-параллельной схеме:
+в последовательно-параллельной схеме:
 
     Разведчик -> [Технолог, Рынок, Команда] -> Интегратор
+
+Модель вызывается через OpenRouter (OpenAI-совместимый API), а не напрямую
+через Anthropic API — верификация личного аккаунта Anthropic не пройдена,
+но OpenRouter отдаёт ту же модель (anthropic/claude-sonnet-4.6) через
+собственные договорённости, в обход этой блокировки.
 
 Сохраняет сырой JSON-вывод каждого агента по каждому стартапу (для аудита
 и ablation study) и сводную таблицу с итоговыми оценками.
@@ -17,18 +22,28 @@ Claude API в последовательно-параллельной схеме
 import argparse
 import concurrent.futures
 import json
+import os
+import random
+import time
 from pathlib import Path
 
 import pandas as pd
-from anthropic import Anthropic
+from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 from dotenv import load_dotenv
 
 from preprocessing import YEARS, compute_trend
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROMPTS_DIR = PROJECT_ROOT / "prompts"
-MODEL = "claude-sonnet-4-6"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+MODEL = "anthropic/claude-sonnet-4.6"
 MAX_TOKENS = 2048
+
+# Провайдеры, через которых OpenRouter роутит модель, иногда отдают временный
+# 429 (shared rate limit) или 5xx — это не повод сразу считать вызов агента
+# неудачным и приближать общий прогон к FAILURE_THRESHOLD.
+MAX_API_RETRIES = 5
+RETRY_BASE_DELAY = 5.0
 
 # Белые списки полей, передаваемых каждому агенту. Поля, палящие исход или
 # принадлежность к группе (Уровень_исхода_0_3, Верифицирован, Источник_исхода,
@@ -202,26 +217,48 @@ def select_fields(row: pd.Series, fields: list[str]) -> dict:
     return out
 
 
-def call_agent(client: Anthropic, system_prompt: str, payload: dict, schema: dict, agent_name: str, model: str = MODEL) -> dict:
-    """Вызывает одного агента с structured output. При ошибке API или парсинга
-    возвращает словарь с ключом _error, не прерывая обработку остальных стартапов."""
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=MAX_TOKENS,
-            system=system_prompt,
-            # Явно выключаем thinking: на части моделей (например, Sonnet 5)
-            # adaptive thinking включён по умолчанию и делит один max_tokens
-            # с текстом ответа — структурированный JSON может обрезаться
-            # посередине. Без этого поведение агентов зависело бы от модели.
-            thinking={"type": "disabled"},
-            output_config={"format": {"type": "json_schema", "schema": schema}},
-            messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)}],
-        )
-        text = next(b.text for b in response.content if b.type == "text")
-        return json.loads(text)
-    except Exception as e:
-        return {"_error": f"{agent_name}: {type(e).__name__}: {e}"}
+def _is_retryable(e: Exception) -> bool:
+    """429 (shared rate limit у провайдера на OpenRouter) и 5xx — временные,
+    стоит повторить. 4xx кроме 429 (неверный ключ, невалидная схема и т.п.) —
+    повторять бессмысленно, ошибка будет той же."""
+    if isinstance(e, (RateLimitError, APIConnectionError)):
+        return True
+    if isinstance(e, APIStatusError):
+        return e.status_code == 429 or e.status_code >= 500
+    return False
+
+
+def call_agent(client: OpenAI, system_prompt: str, payload: dict, schema: dict, agent_name: str, model: str = MODEL) -> dict:
+    """Вызывает одного агента с structured output через OpenRouter, с ретраями
+    на временные сбои (429/5xx у апстрим-провайдера). При невосстановимой
+    ошибке API или парсинга возвращает словарь с ключом _error, не прерывая
+    обработку остальных стартапов. default=str в json.dumps — часть числовых
+    колонок (год, pat_rus_*, pub_*) приходит из pandas как numpy int64,
+    который стандартный json.dumps не сериализует."""
+    last_error = None
+    for attempt in range(1, MAX_API_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                max_tokens=MAX_TOKENS,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2, default=str)},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": agent_name.lower(), "strict": True, "schema": schema},
+                },
+            )
+            text = response.choices[0].message.content
+            return json.loads(text)
+        except Exception as e:
+            last_error = e
+            if attempt == MAX_API_RETRIES or not _is_retryable(e):
+                break
+            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            time.sleep(delay)
+    return {"_error": f"{agent_name}: {type(last_error).__name__}: {last_error}"}
 
 
 def build_tech_payload(row: pd.Series, scout_result: dict) -> dict:
@@ -236,7 +273,7 @@ def build_tech_payload(row: pd.Series, scout_result: dict) -> dict:
     return payload
 
 
-def process_startup(client: Anthropic, row: pd.Series, skip_agents: list[str] = [], model: str = MODEL) -> dict:
+def process_startup(client: OpenAI, row: pd.Series, skip_agents: list[str] = [], model: str = MODEL) -> dict:
     """skip_agents — имена специалистов ("technologist"/"market"/"team"), которые
     нужно пропустить для ablation study. Пропущенный агент даёт None и на входе
     Интегратора, и в сохранённом результате — Интегратор промптом умеет работать
@@ -382,7 +419,7 @@ def main():
     args = parser.parse_args()
 
     load_dotenv(PROJECT_ROOT / ".env")
-    client = Anthropic()  # берёт ANTHROPIC_API_KEY из окружения
+    client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=os.environ["OPENROUTER_API_KEY"])
 
     input_path = PROJECT_ROOT / args.input
     df = load_table(input_path)
