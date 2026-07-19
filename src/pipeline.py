@@ -21,6 +21,7 @@
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import random
@@ -38,6 +39,11 @@ PROMPTS_DIR = PROJECT_ROOT / "prompts"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 MODEL = "anthropic/claude-sonnet-4.6"
 MAX_TOKENS = 2048
+# Параметры генерации фиксируются явно для воспроизводимости прогона.
+# Без явной передачи действует дефолт провайдера (temperature=1.0).
+TEMPERATURE = 0.0
+TOP_P = 1.0
+SEED = 42
 
 # Провайдеры, через которых OpenRouter роутит модель, иногда отдают временный
 # 429 (shared rate limit) или 5xx — это не повод сразу считать вызов агента
@@ -68,7 +74,10 @@ TECH_FIELDS = [
     "pat_foreign_2022", "pat_foreign_2023", "pat_foreign_2024", "pat_foreign_query",
 ]
 MARKET_FIELDS = ["рынок", "инвестиции", "регион", "год"]
-TEAM_FIELDS = ["основатель", "вуз", "регион", "год"]
+# справка_команда — стандартизированная справка об основателе на момент подачи
+# (собрана по единому протоколу, time-locked). Колонки может не быть в старых
+# версиях таблицы — select_fields в этом случае отдаст None, это штатно.
+TEAM_FIELDS = ["основатель", "справка_команда", "вуз", "регион", "год"]
 
 SCOUT_SCHEMA = {
     "type": "object",
@@ -152,13 +161,22 @@ TEAM_SCHEMA = {
     "properties": {
         "team_size_signal": {"type": "string", "enum": ["один основатель", "несколько основателей", "не определено"]},
         "university_signal": {"type": "string"},
+        "founder_experience_signal": {
+            "type": "string",
+            "enum": ["есть профильный опыт", "есть смежный опыт", "опыт не подтверждён", "нет данных"],
+        },
+        "founder_research_signal": {
+            "type": "string",
+            "enum": ["есть публикации/патенты", "нет публикаций/патентов", "нет данных"],
+        },
         "team_strength_score": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
         "confidence": {"type": "string", "enum": ["низкая", "средняя", "высокая"]},
         "data_limitations": {"type": "string"},
         "reasoning": {"type": "string"},
     },
     "required": [
-        "team_size_signal", "university_signal", "team_strength_score",
+        "team_size_signal", "university_signal", "founder_experience_signal",
+        "founder_research_signal", "team_strength_score",
         "confidence", "data_limitations", "reasoning",
     ],
     "additionalProperties": False,
@@ -208,6 +226,21 @@ TECH_PROMPT = load_prompt("02_technologist.txt")
 MARKET_PROMPT = load_prompt("03_market.txt")
 TEAM_PROMPT = load_prompt("04_team.txt")
 INTEGRATOR_PROMPT = load_prompt("05_integrator.txt")
+SINGLE_PROMPT = load_prompt("06_single.txt")
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+# Хэши текстов промптов пишутся в _meta каждого результата, чтобы каждый
+# сохранённый JSON был однозначно привязан к версии промптов.
+PROMPT_HASHES = {
+    "01_scout.txt": _sha256(SCOUT_PROMPT),
+    "02_technologist.txt": _sha256(TECH_PROMPT),
+    "03_market.txt": _sha256(MARKET_PROMPT),
+    "04_team.txt": _sha256(TEAM_PROMPT),
+    "05_integrator.txt": _sha256(INTEGRATOR_PROMPT),
+    "06_single.txt": _sha256(SINGLE_PROMPT),
+}
 
 
 def select_fields(row: pd.Series, fields: list[str]) -> dict:
@@ -237,13 +270,21 @@ def call_agent(client: OpenAI, system_prompt: str, payload: dict, schema: dict, 
     ошибке API или парсинга возвращает словарь с ключом _error, не прерывая
     обработку остальных стартапов. default=str в json.dumps — часть числовых
     колонок (год, pat_rus_*, pub_*) приходит из pandas как numpy int64,
-    который стандартный json.dumps не сериализует."""
+    который стандартный json.dumps не сериализует.
+
+    Параметры генерации (TEMPERATURE/TOP_P/SEED) передаются явно, а в результат
+    добавляется служебный ключ _agent_meta с расходом токенов и числом попыток —
+    для воспроизводимости и учёта стоимости прогона."""
     last_error = None
     for attempt in range(1, MAX_API_RETRIES + 1):
         try:
+            called_at = time.strftime("%Y-%m-%dT%H:%M:%S")
             response = client.chat.completions.create(
                 model=model,
                 max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                seed=SEED,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2, default=str)},
@@ -254,7 +295,18 @@ def call_agent(client: OpenAI, system_prompt: str, payload: dict, schema: dict, 
                 },
             )
             text = response.choices[0].message.content
-            return json.loads(text)
+            result = json.loads(text)
+            usage = getattr(response, "usage", None)
+            result["_agent_meta"] = {
+                "agent": agent_name,
+                "model_reported": getattr(response, "model", None),
+                "attempts": attempt,
+                "called_at": called_at,
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
+            }
+            return result
         except Exception as e:
             last_error = e
             if attempt == MAX_API_RETRIES or not _is_retryable(e):
@@ -272,7 +324,8 @@ def build_tech_payload(row: pd.Series, scout_result: dict) -> dict:
     payload["pat_rus_indicators"] = compute_trend({y: row.get(f"pat_rus_{y}") for y in YEARS})
     payload["pat_foreign_indicators"] = compute_trend({y: row.get(f"pat_foreign_{y}") for y in YEARS})
     payload["pub_indicators"] = compute_trend({y: row.get(f"pub_{y}") for y in YEARS})
-    payload["профиль_разведчика"] = scout_result
+    if scout_result is not None:
+        payload["профиль_разведчика"] = scout_result
     return payload
 
 
@@ -281,10 +334,13 @@ def process_startup(client: OpenAI, row: pd.Series, skip_agents: list[str] = [],
     нужно пропустить для ablation study. Пропущенный агент даёт None и на входе
     Интегратора, и в сохранённом результате — Интегратор промптом умеет работать
     с отсутствующим измерением (см. missing_dimensions в его схеме)."""
-    scout_payload = select_fields(row, SCOUT_FIELDS)
-    scout_result = call_agent(client, SCOUT_PROMPT, scout_payload, SCOUT_SCHEMA, "Scout", model)
-
-    shared_context = {"профиль_разведчика": scout_result}
+    if "scout" in skip_agents:
+        scout_result = None
+        shared_context = {}
+    else:
+        scout_payload = select_fields(row, SCOUT_FIELDS)
+        scout_result = call_agent(client, SCOUT_PROMPT, scout_payload, SCOUT_SCHEMA, "Scout", model)
+        shared_context = {"профиль_разведчика": scout_result}
     tech_payload = build_tech_payload(row, scout_result)
     market_payload = {**select_fields(row, MARKET_FIELDS), **shared_context}
     team_payload = {**select_fields(row, TEAM_FIELDS), **shared_context}
@@ -323,6 +379,25 @@ def process_startup(client: OpenAI, row: pd.Series, skip_agents: list[str] = [],
     }
 
 
+def process_startup_single(client: OpenAI, row: pd.Series, model: str = MODEL) -> dict:
+    """Абляция мультиагентности: один вызов LLM получает объединение всех
+    белых списков полей + предвычисленные индикаторы и заполняет ту же
+    схему, что Интегратор. Результат кладётся в ключ integrator, чтобы
+    to_summary_row/is_complete и офлайн-валидация работали без изменений."""
+    payload = select_fields(row, SCOUT_FIELDS + TECH_FIELDS + MARKET_FIELDS + TEAM_FIELDS)
+    payload["pat_rus_indicators"] = compute_trend({y: row.get(f"pat_rus_{y}") for y in YEARS})
+    payload["pat_foreign_indicators"] = compute_trend({y: row.get(f"pat_foreign_{y}") for y in YEARS})
+    payload["pub_indicators"] = compute_trend({y: row.get(f"pub_{y}") for y in YEARS})
+    result = call_agent(client, SINGLE_PROMPT, payload, INTEGRATOR_SCHEMA, "Single", model)
+    return {
+        "scout": None,
+        "technologist": None,
+        "market": None,
+        "team": None,
+        "integrator": result,
+    }
+
+
 def to_summary_row(idx: int, name: str, result: dict) -> dict:
     scout, tech, market, team, integrator = (
         result["scout"], result["technologist"], result["market"], result["team"], result["integrator"]
@@ -333,6 +408,10 @@ def to_summary_row(idx: int, name: str, result: dict) -> dict:
     tech = tech or {}
     market = market or {}
     team = team or {}
+    total_tokens = 0
+    for d in (scout, tech, market, team, integrator):
+        meta = (d or {}).get("_agent_meta") or {}
+        total_tokens += meta.get("total_tokens") or 0
     return {
         "idx": idx,
         "Name": name,
@@ -347,6 +426,7 @@ def to_summary_row(idx: int, name: str, result: dict) -> dict:
         "team_confidence": team.get("confidence"),
         "rationale": integrator.get("rationale"),
         "expert_top_likelihood": integrator.get("expert_top_likelihood"),
+        "total_tokens": total_tokens,
         "errors": "; ".join(errors) if errors else "",
     }
 
@@ -383,15 +463,14 @@ def is_complete(result: dict) -> bool:
     """Стартап считается успешно посчитанным, если Scout и Integrator
     отработали без ошибок (Technologist/Market/Team могут быть None из-за
     --skip-agent — это не ошибка, а осознанный ablation)."""
-    return "_error" not in result.get("scout", {}) and "_error" not in result.get("integrator", {})
+    return "_error" not in (result.get("scout") or {}) and "_error" not in (result.get("integrator") or {})
 
 
-def load_cached(path: Path, name: str, model: str) -> dict | None:
-    """Возвращает сохранённый результат, если он есть, читается и относится
-    к тому же стартапу (Name) и той же модели — иначе None, и стартап будет
-    пересчитан. Сверка по Name защищает от коллизий idx при переиспользовании
-    --output-dir для другого входного файла; сверка по модели — от того, чтобы
-    сравнение моделей (--model) по ошибке подхватило кэш от предыдущей."""
+def load_cached(path: Path, name: str, model: str, mode: str, skip: list[str]) -> dict | None:
+    """Возвращает сохранённый результат, только если он относится к тому же
+    стартапу (Name), той же модели, тому же режиму (mas/single) и тому же
+    набору пропущенных агентов — иначе None, и стартап будет пересчитан.
+    Старые кэши без полей _mode/_skip считаются несовместимыми."""
     if not path.exists():
         return None
     try:
@@ -399,6 +478,9 @@ def load_cached(path: Path, name: str, model: str) -> dict | None:
     except (json.JSONDecodeError, OSError):
         return None
     if cached.get("_name") != name or cached.get("_model") != model:
+        return None
+    # require mode and skip to match; older caches without these fields are incompatible
+    if cached.get("_mode") != mode or cached.get("_skip") != skip:
         return None
     return cached
 
@@ -409,8 +491,8 @@ def main():
     parser.add_argument("--output-dir", default="results", help="Куда сохранять результаты")
     parser.add_argument("--limit", type=int, default=None, help="Ограничить число стартапов (для отладки)")
     parser.add_argument(
-        "--skip-agent", nargs="+", choices=["technologist", "market", "team"],
-        default=[], help="Пропустить указанных специалистов (для ablation study)",
+        "--skip-agent", nargs="+", choices=["scout", "technologist", "market", "team"],
+        default=[], help="Пропустить указанных агентов (для ablation study). Можно указать несколько сразу.",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -420,7 +502,18 @@ def main():
         "--model", default=MODEL,
         help=f"Модель для всех 5 агентов (по умолчанию {MODEL})",
     )
+    parser.add_argument(
+        "--mode", choices=["mas", "single"], default="mas",
+        help="mas — полная мультиагентная схема; single — один вызов LLM со всеми полями (абляция мультиагентности)",
+    )
     args = parser.parse_args()
+
+    if set(args.skip_agent) == {"scout", "technologist", "market", "team"}:
+        parser.error(
+            "--skip-agent scout technologist market team отключает все входные измерения "
+            "Интегратора одновременно — такой прогон не даёт содержательной оценки. "
+            "Отключайте не более трёх агентов за раз."
+        )
 
     load_dotenv(PROJECT_ROOT / ".env")
     client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=os.environ["OPENROUTER_API_KEY"])
@@ -442,15 +535,29 @@ def main():
         name = row.get("Name", f"row_{idx}")
         json_path = output_dir / f"{idx:04d}.json"
 
-        cached = None if args.force else load_cached(json_path, name, args.model)
+        cached = None if args.force else load_cached(json_path, name, args.model, args.mode, sorted(args.skip_agent))
         if cached is not None and is_complete(cached):
             print(f"[{position}/{total}] {name} — уже посчитан, пропускаю")
             result = cached
         else:
             print(f"[{position}/{total}] {name}")
-            result = process_startup(client, row, skip_agents=args.skip_agent, model=args.model)
+            if args.mode == "single":
+                result = process_startup_single(client, row, model=args.model)
+            else:
+                result = process_startup(client, row, skip_agents=args.skip_agent, model=args.model)
             result["_name"] = name
             result["_model"] = args.model
+            result["_mode"] = args.mode
+            result["_skip"] = sorted(args.skip_agent)
+            result["_meta"] = {
+                "model": args.model,
+                "temperature": TEMPERATURE,
+                "top_p": TOP_P,
+                "seed": SEED,
+                "max_tokens": MAX_TOKENS,
+                "prompt_hashes": PROMPT_HASHES,
+                "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
             save_json(result, json_path)
 
             if is_complete(result):
