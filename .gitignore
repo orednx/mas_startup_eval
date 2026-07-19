@@ -8,3 +8,6 @@ results_batch/
 private/
 .DS_Store
 logs/
+# Ignore result output folders
+/results/
+/results*
