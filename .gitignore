@@ -8,6 +8,8 @@ results_batch/
 private/
 .DS_Store
 logs/
+# Ignore shadow data folder
+Data/.shadow/
 # Ignore result output folders
 /results/
 /results*
